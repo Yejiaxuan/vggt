@@ -16,10 +16,12 @@ from vggt.heads.track_head import TrackHead
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
-                 enable_camera=True, enable_point=True, enable_depth=True, enable_track=True, enable_eep=True):
+                 enable_camera=True, enable_point=True, enable_depth=True, enable_track=True, enable_eep=True,
+                 global_attention="dense", pnp_num_landmarks_per_frame=16, pnp_max_landmark_frames=8,
+                 pnp_pinv_iterations=5, pnp_token_chunk_size=2048, pnp_long_path_precision="bfloat16"):
         super().__init__()
 
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim, global_attention=global_attention, pnp_num_landmarks_per_frame=pnp_num_landmarks_per_frame, pnp_max_landmark_frames=pnp_max_landmark_frames, pnp_pinv_iterations=pnp_pinv_iterations, pnp_token_chunk_size=pnp_token_chunk_size, pnp_long_path_precision=pnp_long_path_precision)
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1") if enable_point else None
@@ -139,6 +141,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predictions["images"] = images  # store the images for visualization during inference
 
         return predictions
+
+    def pnp_nystra_scope(self):
+        return self.aggregator.pnp_nystra_scope()
 
 
 class _EarlyProjectionSink:

@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +14,7 @@ from typing import Optional, Tuple, Union, List, Dict, Any
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
+from vggt.layers.pnp_nystra_attention import FramewisePnPNystraAttention
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
 
@@ -69,6 +71,12 @@ class Aggregator(nn.Module):
         rope_freq=100,
         init_values=0.01,
         cached_layer_indices: Tuple[int, ...] = (4, 11, 17, 23),
+        global_attention: str = "dense",
+        pnp_num_landmarks_per_frame: int = 16,
+        pnp_max_landmark_frames: int = 8,
+        pnp_pinv_iterations: int = 5,
+        pnp_token_chunk_size: int = 2048,
+        pnp_long_path_precision: str = "bfloat16",
     ):
         super().__init__()
 
@@ -95,6 +103,25 @@ class Aggregator(nn.Module):
             ]
         )
 
+        if global_attention not in {"dense", "pnp_nystra"}:
+            raise ValueError(f"Unsupported global attention backend: {global_attention}")
+        self.global_attention = global_attention
+        self.pnp_num_landmarks_per_frame = int(pnp_num_landmarks_per_frame)
+        self.pnp_max_landmark_frames = int(pnp_max_landmark_frames)
+        self.pnp_pinv_iterations = int(pnp_pinv_iterations)
+        self.pnp_token_chunk_size = int(pnp_token_chunk_size)
+        self.pnp_long_path_precision = str(pnp_long_path_precision)
+
+        global_kwargs = {}
+        if global_attention == "pnp_nystra":
+            global_kwargs["attn_class"] = partial(
+                FramewisePnPNystraAttention,
+                num_landmarks_per_frame=self.pnp_num_landmarks_per_frame,
+                max_landmark_frames=self.pnp_max_landmark_frames,
+                pinv_iterations=self.pnp_pinv_iterations,
+                token_chunk_size=self.pnp_token_chunk_size,
+                long_path_precision=self.pnp_long_path_precision,
+            )
         self.global_blocks = nn.ModuleList(
             [
                 block_fn(
@@ -107,10 +134,15 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    **global_kwargs,
                 )
                 for _ in range(depth)
             ]
         )
+        for layer_index, block in enumerate(self.global_blocks):
+            if isinstance(block.attn, FramewisePnPNystraAttention):
+                block.attn.layer_index = layer_index
+                block.attn.last_pnp_info["layer_index"] = layer_index
 
         self.depth = depth
         self.aa_order = aa_order
@@ -264,7 +296,7 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos, need_intermediates=need_intermediates
+                        tokens, B, S, P, C, global_idx, pos=pos, need_intermediates=need_intermediates, patch_grid_size=patch_grid_size
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -328,7 +360,7 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, need_intermediates=True):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, need_intermediates=True, patch_grid_size=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -342,6 +374,16 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
+            attention = self.global_blocks[global_idx].attn
+            if isinstance(attention, FramewisePnPNystraAttention):
+                if patch_grid_size is None:
+                    raise ValueError("PnP-Nystra requires the per-frame patch grid")
+                attention.set_frame_layout(
+                    num_frames=S,
+                    tokens_per_frame=P,
+                    patch_start_idx=self.patch_start_idx,
+                    patch_grid_size=patch_grid_size,
+                )
             if self.training:
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
@@ -351,6 +393,61 @@ class Aggregator(nn.Module):
                 intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
+
+    def pnp_nystra_scope(self) -> dict[str, object]:
+        pnp_attentions = tuple(
+            block.attn
+            for block in self.global_blocks
+            if isinstance(block.attn, FramewisePnPNystraAttention)
+        )
+        layers = [
+            int(attention.layer_index)
+            for attention in pnp_attentions
+            if attention.method_enabled and attention.layer_index is not None
+        ]
+        enabled = self.global_attention == "pnp_nystra" and bool(layers)
+        return {
+            "configured": self.global_attention == "pnp_nystra",
+            "enabled": enabled,
+            "enabled_global_layers": layers,
+            "enabled_heads_per_layer": (
+                list(range(pnp_attentions[0].num_heads)) if enabled else []
+            ),
+            "num_landmarks_per_frame": self.pnp_num_landmarks_per_frame if enabled else 0,
+            "pinv_iterations": self.pnp_pinv_iterations if enabled else 0,
+            "token_chunk_size": self.pnp_token_chunk_size if enabled else 0,
+            "max_landmark_frames": self.pnp_max_landmark_frames if enabled else None,
+            "long_path_precision": self.pnp_long_path_precision if enabled else "none",
+            "layer_runs": [attention.last_pnp_info for attention in pnp_attentions],
+        }
+
+    def configure_pnp_nystra(
+        self,
+        *,
+        enabled: bool,
+        active_layers: tuple[int, ...] | list[int] | None = None,
+    ) -> None:
+        if self.global_attention != "pnp_nystra":
+            raise RuntimeError("PnP-Nystra was not constructed for this Aggregator")
+        if not enabled:
+            selected_layers: set[int] = set()
+        elif active_layers is None:
+            selected_layers = set(range(self.depth))
+        else:
+            selected_layers = {int(layer) for layer in active_layers}
+            invalid = sorted(layer for layer in selected_layers if layer < 0 or layer >= self.depth)
+            if invalid:
+                raise ValueError(f"PnP-Nystra active layers are outside [0, {self.depth}): {invalid}")
+        found = 0
+        for block in self.global_blocks:
+            attention = block.attn
+            if isinstance(attention, FramewisePnPNystraAttention):
+                attention.set_method_enabled(attention.layer_index in selected_layers)
+                found += 1
+        if found != self.depth:
+            raise RuntimeError(
+                f"PnP-Nystra attention coverage changed: {found}/{self.depth} global layers"
+            )
 
 
 def slice_expand_and_flatten(token_tensor, B, S):
