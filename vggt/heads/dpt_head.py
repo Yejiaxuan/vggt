@@ -9,6 +9,7 @@
 
 
 import os
+from dataclasses import dataclass
 from typing import List, Dict, Tuple, Union
 
 import torch
@@ -16,6 +17,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .head_act import activate_head
 from .utils import create_uv_grid, position_grid_to_embed
+
+
+@dataclass
+class DPTProjectedCache:
+    """DPT prefix outputs captured by Exact Early Projection."""
+
+    features: Dict[int, torch.Tensor]
+    patch_grid_size: Tuple[int, int]
 
 
 class DPTHead(nn.Module):
@@ -114,7 +123,7 @@ class DPTHead(nn.Module):
 
     def forward(
         self,
-        aggregated_tokens_list: List[torch.Tensor],
+        aggregated_tokens_list: Union[List[torch.Tensor], DPTProjectedCache],
         images: torch.Tensor,
         patch_start_idx: int,
         frames_chunk_size: int = 8,
@@ -122,7 +131,8 @@ class DPTHead(nn.Module):
         """
         Forward pass through the DPT head, supports processing by chunking frames.
         Args:
-            aggregated_tokens_list (List[Tensor]): List of token tensors from different transformer layers.
+            aggregated_tokens_list: Raw aggregator taps or features produced by
+                Exact Early Projection.
             images (Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
             patch_start_idx (int): Starting index for patch tokens in the token sequence.
                 Used to separate patch tokens from other tokens (e.g., camera or register tokens).
@@ -169,9 +179,80 @@ class DPTHead(nn.Module):
         else:
             return torch.cat(all_preds, dim=1), torch.cat(all_conf, dim=1)
 
+    def project_cached_layer(
+        self,
+        feature_idx: int,
+        frame_tokens: torch.Tensor,
+        global_tokens: torch.Tensor,
+        patch_start_idx: int,
+        patch_grid_size: Tuple[int, int],
+        frames_chunk_size: int = 8,
+    ) -> torch.Tensor:
+        """Apply this head's fixed prefix while an aggregator tap is live."""
+        if frame_tokens.shape != global_tokens.shape or frame_tokens.ndim != 4:
+            raise ValueError(
+                "Expected matching [B, S, P, C] frame/global taps, got "
+                f"{tuple(frame_tokens.shape)} and {tuple(global_tokens.shape)}"
+            )
+        if frame_tokens.dtype != torch.float32 or global_tokens.dtype != torch.float32:
+            raise TypeError(
+                "Exact Early Projection requires fp32 aggregator taps, got "
+                f"{frame_tokens.dtype} and {global_tokens.dtype}"
+            )
+        if not 0 <= feature_idx < len(self.projects):
+            raise IndexError(f"Invalid DPT feature index {feature_idx}")
+        if frames_chunk_size is not None and frames_chunk_size <= 0:
+            raise ValueError(f"frames_chunk_size must be positive or None, got {frames_chunk_size}")
+
+        B, S, P, _ = frame_tokens.shape
+        patch_h, patch_w = patch_grid_size
+        if not 0 <= patch_start_idx <= P or P - patch_start_idx != patch_h * patch_w:
+            raise ValueError(
+                f"Tap with {P} tokens and patch start {patch_start_idx} "
+                f"does not match grid {patch_grid_size}"
+            )
+
+        chunk_size = S if frames_chunk_size is None else frames_chunk_size
+        projected_cache = None
+        for start in range(0, S, chunk_size):
+            end = min(start + chunk_size, S)
+            with torch.autocast(device_type=frame_tokens.device.type, enabled=False):
+                patch_tokens = torch.cat(
+                    [
+                        frame_tokens[:, start:end, patch_start_idx:],
+                        global_tokens[:, start:end, patch_start_idx:],
+                    ],
+                    dim=-1,
+                )
+                projected = self._project_feature(feature_idx, patch_tokens, patch_grid_size)
+            projected = projected.view(B, end - start, *projected.shape[1:])
+            if projected_cache is None:
+                projected_cache = projected.new_empty(B, S, *projected.shape[2:])
+            projected_cache[:, start:end].copy_(projected)
+
+        if projected_cache is None:
+            raise ValueError("Cannot project an empty frame sequence")
+        return projected_cache
+
+    def _project_feature(
+        self,
+        feature_idx: int,
+        patch_tokens: torch.Tensor,
+        patch_grid_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        B, S, patch_count, _ = patch_tokens.shape
+        patch_h, patch_w = patch_grid_size
+        if patch_count != patch_h * patch_w:
+            raise ValueError(f"Patch count {patch_count} does not match grid {patch_grid_size}")
+
+        x = patch_tokens.reshape(B * S, patch_count, patch_tokens.shape[-1])
+        x = self.norm(x)
+        x = x.permute(0, 2, 1).reshape(B * S, x.shape[-1], patch_h, patch_w)
+        return self.projects[feature_idx](x)
+
     def _forward_impl(
         self,
-        aggregated_tokens_list: List[torch.Tensor],
+        aggregated_tokens_list: Union[List[torch.Tensor], DPTProjectedCache],
         images: torch.Tensor,
         patch_start_idx: int,
         frames_start_idx: int = None,
@@ -192,6 +273,8 @@ class DPTHead(nn.Module):
         Returns:
             Tensor or Tuple[Tensor, Tensor]: Feature maps or (predictions, confidence).
         """
+        full_B, full_S = images.shape[:2]
+        frame_slice = slice(frames_start_idx, frames_end_idx) if frames_start_idx is not None else slice(None)
         if frames_start_idx is not None and frames_end_idx is not None:
             images = images[:, frames_start_idx:frames_end_idx].contiguous()
 
@@ -199,29 +282,36 @@ class DPTHead(nn.Module):
 
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
+        projected_cache = aggregated_tokens_list if isinstance(aggregated_tokens_list, DPTProjectedCache) else None
+        if projected_cache is not None and projected_cache.patch_grid_size != (patch_h, patch_w):
+            raise ValueError(
+                f"Projected DPT grid {projected_cache.patch_grid_size} "
+                f"does not match image grid {(patch_h, patch_w)}"
+            )
+
         out = []
-        dpt_idx = 0
+        for dpt_idx, layer_idx in enumerate(self.intermediate_layer_idx):
+            if projected_cache is None:
+                x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
+                x = x[:, frame_slice]
+                x = self._project_feature(dpt_idx, x, (patch_h, patch_w))
+            else:
+                x = projected_cache.features.get(layer_idx)
+                if x is None:
+                    raise ValueError(f"Projected DPT cache is missing layer {layer_idx}")
+                if x.ndim != 5 or x.shape[:2] != (full_B, full_S):
+                    raise ValueError(
+                        f"Projected layer {layer_idx} must start with {(full_B, full_S)}, "
+                        f"got {tuple(x.shape)}"
+                    )
+                x = x[:, frame_slice].reshape(B * S, *x.shape[2:])
+                x = x.contiguous(memory_format=torch.channels_last)
 
-        for layer_idx in self.intermediate_layer_idx:
-            x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
-
-            # Select frames if processing a chunk
-            if frames_start_idx is not None and frames_end_idx is not None:
-                x = x[:, frames_start_idx:frames_end_idx]
-
-            x = x.reshape(B * S, -1, x.shape[-1])
-
-            x = self.norm(x)
-
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
-
-            x = self.projects[dpt_idx](x)
             if self.pos_embed:
                 x = self._apply_pos_embed(x, W, H)
             x = self.resize_layers[dpt_idx](x)
 
             out.append(x)
-            dpt_idx += 1
 
         # Fuse features from multiple layers.
         out = self.scratch_forward(out)

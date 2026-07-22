@@ -184,11 +184,13 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[Optional[torch.Tensor]], int]:
+    def forward(self, images: torch.Tensor, early_projection_sink=None) -> Tuple[List[Optional[torch.Tensor]], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            early_projection_sink (optional): Internal consumer for selected
+                frame/global taps. ``None`` preserves the original cache path.
 
         Returns:
             (list[torch.Tensor | None], int):
@@ -241,11 +243,19 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
+        capture_layer_indices = self.cached_layer_indices
+        if early_projection_sink is not None:
+            capture_layer_indices = set(early_projection_sink.required_layer_indices)
+            capture_layer_indices.add(self.depth - 1)
+            invalid = sorted(idx for idx in capture_layer_indices if not 0 <= idx < self.depth)
+            if invalid:
+                raise ValueError(f"Early projection requested invalid layers: {invalid}")
+        patch_grid_size = (H // self.patch_size, W // self.patch_size)
 
         for _ in range(self.aa_block_num):
             next_layer_idx = len(output_list)
             need_intermediates = any(
-                (next_layer_idx + i) in self.cached_layer_indices for i in range(self.aa_block_size)
+                (next_layer_idx + i) in capture_layer_indices for i in range(self.aa_block_size)
             )
             for attn_type in self.aa_order:
                 if attn_type == "frame":
@@ -261,7 +271,28 @@ class Aggregator(nn.Module):
 
             for i in range(self.aa_block_size):
                 layer_idx = len(output_list)
-                if layer_idx in self.cached_layer_indices:
+                if early_projection_sink is not None:
+                    if layer_idx in early_projection_sink.required_layer_indices:
+                        early_projection_sink.consume(
+                            layer_idx,
+                            frame_intermediates[i],
+                            global_intermediates[i],
+                            self.patch_start_idx,
+                            patch_grid_size,
+                        )
+                    if layer_idx == self.depth - 1:
+                        output_list.append(
+                            torch.cat(
+                                [
+                                    frame_intermediates[i][:, :, : self.patch_start_idx],
+                                    global_intermediates[i][:, :, : self.patch_start_idx],
+                                ],
+                                dim=-1,
+                            )
+                        )
+                    else:
+                        output_list.append(None)
+                elif layer_idx in self.cached_layer_indices:
                     # concat frame and global intermediates, [B x S x P x 2C]
                     concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                     output_list.append(concat_inter)
